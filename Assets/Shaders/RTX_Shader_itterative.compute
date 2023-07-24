@@ -1,0 +1,356 @@
+﻿#pragma kernel CSMain
+
+RWTexture2D<float4> Result;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+float4 _DirectionalLight;
+
+float _ReflectionDepth;
+
+Texture2D<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+
+static const float PI = 3.14159265f;
+
+//-------------------------------------
+//- UTILITY
+
+float sdot(float3 x, float3 y, float f = 1.0f)
+{
+    return saturate(dot(x, y) * f);
+}
+
+float energy(float3 color)
+{
+    return dot(color, 1.0f / 3.0f);
+}
+
+//-------------------------------------
+//- RANDOMNESS
+
+float2 _Pixel;
+float _Seed;
+
+float rand()
+{
+    float result = frac(sin(_Seed / 100.0f * dot(_Pixel, float2(12.9898f, 78.233f))) * 43758.5453f);
+    _Seed += 1.0f;
+    return result;
+}
+
+
+//-------------------------------------
+//- SPHERES
+
+struct Object
+{
+    int type; // 1: Sphere
+
+    float3 position1;
+    float3 position2;
+    float radius1;
+    float radius2;
+    float4x4 LocalToWorld;
+    float4x4 WorldToLocal;
+    
+    float3 albedo;
+    float3 specular;
+    float smoothness;
+    float3 emission;
+};
+
+StructuredBuffer<Object> _Objects;
+
+
+//-------------------------------------
+//- RAY
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+    float3 energy;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    ray.energy = float3(1.0f, 1.0f, 1.0f);
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+
+    return CreateRay(origin, direction);
+}
+
+
+//-------------------------------------
+//- RAYHIT
+
+struct RayHit
+{
+    float3 position;
+    float distance;
+    float3 normal;
+    float3 albedo;
+    float3 specular;
+    float smoothness;
+    float3 emission;
+};
+
+RayHit CreateRayHit()
+{
+    RayHit hit;
+    hit.position = float3(0.0f, 0.0f, 0.0f);
+    hit.distance = 1.#INF;
+    hit.normal = float3(0.0f, 0.0f, 0.0f);
+    hit.albedo = float3(0.0f, 0.0f, 0.0f);
+    hit.specular = float3(0.0f, 0.0f, 0.0f);
+    hit.smoothness = 0.0f;
+    hit.emission = float3(0.0f, 0.0f, 0.0f);
+    return hit;
+}
+
+
+//-------------------------------------
+//- INTERSECTION
+
+void IntersectGroundPlane(Ray ray, inout RayHit bestHit)
+{
+    // Calculate distance along the ray where the ground plane is intersected
+    float t = -ray.origin.y / ray.direction.y;
+    if (t > 0 && t < bestHit.distance)
+    {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = float3(0.0f, 1.0f, 0.0f);
+        bestHit.albedo = 0.5f;
+        bestHit.specular = 0.03f;
+        bestHit.smoothness = 0;
+        bestHit.emission = float3(0.0f, 0.0f, 0.0f);
+    }
+}
+
+void IntersectSphere(Ray ray, inout RayHit bestHit, Object sphere)
+{
+    // Calculate distance along the ray where the sphere is intersected
+    float3 d = ray.origin - sphere.position1;
+    float p1 = -dot(ray.direction, d);
+    float p2sqr = p1 * p1 - dot(d, d) + sphere.radius1 * sphere.radius1;
+    if (p2sqr < 0)
+        return;
+    float p2 = sqrt(p2sqr);
+    float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2;
+    if (t > 0 && t < bestHit.distance)
+    {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - sphere.position1);
+        bestHit.albedo = sphere.albedo;
+        bestHit.specular = sphere.specular;
+        bestHit.smoothness = sphere.smoothness;
+        bestHit.emission = sphere.emission;
+    }
+}
+
+
+void intersectObject(Ray ray, inout RayHit bestHit, Object object){
+    switch (object.type){
+        case 1:{
+            IntersectSphere(ray, bestHit, object);
+            break;
+        }
+        default: break;
+    }
+}
+
+
+
+
+//-------------------------------------
+//- SAMPLING
+
+float3x3 GetTangentSpace(float3 normal)
+{
+    // Choose a helper vector for the cross product
+    float3 helper = float3(1, 0, 0);
+    if (abs(normal.x) > 0.99f)
+        helper = float3(0, 0, 1);
+
+    // Generate vectors
+    float3 tangent = normalize(cross(normal, helper));
+    float3 binormal = normalize(cross(normal, tangent));
+    return float3x3(tangent, binormal, normal);
+}
+
+float3 SampleHemisphere(float3 normal, float alpha)
+{
+    // Sample the hemisphere, where alpha determines the kind of the sampling
+    float cosTheta = pow(rand(), 1.0f / (alpha + 1.0f));
+    float sinTheta = sqrt(1.0f - cosTheta * cosTheta);
+    float phi = 2 * PI * rand();
+    float3 tangentSpaceDir = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+
+    // Transform direction to world space
+    return mul(tangentSpaceDir, GetTangentSpace(normal));
+}
+
+//-------------------------------------
+//- RAY QUEUE
+struct QueueableRay{
+    Ray ray;
+
+    float3 result;
+    uint parentRay;
+    uint type;
+    bool specDone;
+    bool diffDone;
+};
+
+uint queueTop=0;
+
+const static uint queueSize = 10;
+
+#define MAIN 1
+#define SPECULAR 2
+#define DIFFUSE 3
+
+QueueableRay rays[queueSize];
+
+bool addRay(Ray ray, uint parent, uint type){
+    if (queueTop == queueSize){
+        return false;
+    }
+    QueueableRay qray;
+    qray.ray = ray;
+    qray.result = 0;
+    qray.parent = parent;
+    qray.type = type;
+    qray.specDone = false;
+    qray.diffDone = false;
+
+    rays[++queueTop] = qray;
+    return true;
+}
+
+//-------------------------------------
+//- TRACE
+
+float3 Trace(Ray ray)
+{
+    addRay(ray, 0, MAIN);
+
+    while (queueTop != 0){
+        RayHit hit = CreateRayHit();
+
+        uint rayIDX = queueTop;
+
+        // Trace ground plane
+        IntersectGroundPlane(rays[rayIDX].ray, hit);
+
+        // Trace spheres
+        uint numSpheres, stride;
+        _Objects.GetDimensions(numSpheres, stride);
+        for (uint i = 0; i < numSpheres; i++)
+            intersectObject(rays[rayIDX].ray, hit, _Objects[i]);
+        
+        if (hit.distance < 1.#INF)
+        {
+            // Calculate percentages of diffuse and specular reflection
+            float specPerc = energy(hit.specular);
+            float diffPerc = energy(hit.albedo);
+            float tmp = specPerc + diffPerc;
+            specPerc /= tmp;
+            diffPerc /= tmp;
+            
+            // Specular reflection
+            Ray specRay;
+            specRay.origin = hit.position + hit.normal * 0.001f;
+            float alpha = SmoothnessToPhongAlpha(hit.smoothness);
+            specRay.direction = SampleHemisphere(reflect(specRay.direction, hit.normal), alpha);
+            float f = (alpha + 2) / (alpha + 1);
+            addRay(specRay, rayIDX, SPECULAR);
+            //specRay.energy *= (1.0f / specChance) * hit.specular * sdot(hit.normal, specRay.direction, f);
+            
+        
+            // Diffuse reflection
+            Ray diffRay;
+            diffRay.origin = hit.position + hit.normal * 0.001f;
+            diffRay.direction = SampleHemisphere(hit.normal, 1.0f);
+            addRay(diffRay, rayIDX, DIFFUSE);
+            //diffRay.energy *= (1.0f / diffChance) * hit.albedo;
+            
+
+            return hit.emission;
+        }
+        else
+        {
+            // Erase the ray's energy - the sky doesn't reflect anything
+            ray.energy = 0.0f;
+
+            // Sample the skybox and write it
+            float theta = acos(ray.direction.y) / -PI;
+            float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+            return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+        }
+    }
+
+}
+
+//-------------------------------------
+//- SHADE
+
+float SmoothnessToPhongAlpha(float s)
+{
+    return pow(1000.0f, s * s);
+}
+
+
+//-------------------------------------
+//- KERNEL
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    _Pixel = id.xy;
+
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    // Transform pixel to [-1,1] range
+    float2 uv = float2((id.xy + 0.5f) / float2(width, height) * 2.0f - 1.0f);
+
+    // Get a ray for the UVs
+    Ray ray = CreateCameraRay(uv);
+
+    // Trace and shade the ray
+    float3 result = 0;
+    for (int i = 0; i < _ReflectionDepth; i++)
+    {
+        RayHit hit = Trace(ray);
+        result += ray.energy * Shade(ray, hit);
+
+        if (!any(ray.energy))
+            break;
+    }
+            
+        
+    
+
+    Result[id.xy] = float4(result, 1);
+}
